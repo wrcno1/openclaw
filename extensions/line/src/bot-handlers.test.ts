@@ -426,6 +426,27 @@ describe("handleLineWebhookEvents", () => {
     expect(processMessage).toHaveBeenCalledTimes(1);
   });
 
+  it("blocks unauthorized group control commands even when an open group sender is allowed", async () => {
+    const processMessage = vi.fn();
+    await handleLineWebhookEvents(
+      [
+        createTestMessageEvent({
+          message: { id: "m3b", type: "text", text: "!status", quoteToken: "quote-token" },
+          source: { type: "group", groupId: "group-1", userId: "user-open" },
+          webhookEventId: "evt-3b",
+        }),
+      ],
+      createLineWebhookTestContext({
+        processMessage,
+        groupPolicy: "open",
+        requireMention: true,
+      }),
+    );
+
+    expect(buildLineMessageContextMock).not.toHaveBeenCalled();
+    expect(processMessage).not.toHaveBeenCalled();
+  });
+
   it("blocks group sender not in groupAllowFrom without consulting the DM pairing store", async () => {
     const processMessage = vi.fn();
     const event = {

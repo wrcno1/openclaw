@@ -330,8 +330,18 @@ async function shouldProcessLineEvent(
     log: (message) => logVerbose(message),
   });
 
-  if (access.senderAccess.decision === "allow") {
+  if (
+    access.senderAccess.decision === "allow" &&
+    (access.ingress.admission === "dispatch" ||
+      access.ingress.admission === "observe" ||
+      access.ingress.admission === "skip")
+  ) {
     return access;
+  }
+
+  if (access.senderAccess.decision === "allow") {
+    logVerbose(`Blocked line event (${access.ingress.reasonCode})`);
+    return null;
   }
 
   if (isGroup) {
