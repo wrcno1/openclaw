@@ -29,14 +29,19 @@ describe("qqbot: prefix normalization for inbound commandAuthorized", () => {
   async function resolveInboundCommandAuthorized(
     rawAllowFrom: string[],
     senderId: string,
+    options: {
+      isGroup?: boolean;
+      groupAllowFrom?: string[];
+    } = {},
   ): Promise<boolean> {
     const result = await access.resolveInboundAccess({
       cfg: {},
       accountId: "default",
-      conversationId: senderId,
-      isGroup: false,
+      conversationId: options.isGroup ? "group-openid" : senderId,
+      isGroup: options.isGroup ?? false,
       senderId,
       allowFrom: rawAllowFrom,
+      groupAllowFrom: options.groupAllowFrom,
     });
     return result.commandAccess.authorized === true;
   }
@@ -59,5 +64,20 @@ describe("qqbot: prefix normalization for inbound commandAuthorized", () => {
 
   it("authorizes any sender when allowFrom contains wildcard *", async () => {
     await expect(resolveInboundCommandAuthorized(["*"], "ANYONE")).resolves.toBe(true);
+  });
+
+  it("denies group command auth in an open group without explicit allowlists", async () => {
+    await expect(resolveInboundCommandAuthorized([], "ANYONE", { isGroup: true })).resolves.toBe(
+      false,
+    );
+  });
+
+  it("authorizes group command auth for an explicit group allowlist sender", async () => {
+    await expect(
+      resolveInboundCommandAuthorized([], "GROUP_OWNER", {
+        isGroup: true,
+        groupAllowFrom: ["qqbot:GROUP_OWNER"],
+      }),
+    ).resolves.toBe(true);
   });
 });

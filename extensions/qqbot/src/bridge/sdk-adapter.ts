@@ -83,8 +83,11 @@ export function createSdkAccessAdapter(): AccessPort {
       const dmAllowFromForIngress =
         dmPolicy === "open" && normalizedAllowFrom.length === 0 ? ["*"] : (input.allowFrom ?? []);
 
-      const commandOwnerAllowFrom =
-        input.allowFrom && input.allowFrom.length > 0 ? input.allowFrom : ["*"];
+      const commandOwnerAllowFrom = input.isGroup
+        ? []
+        : input.allowFrom && input.allowFrom.length > 0
+          ? input.allowFrom
+          : ["*"];
       const resolved = await createChannelIngressResolver({
         channelId: "qqbot",
         accountId: input.accountId,
