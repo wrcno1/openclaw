@@ -702,6 +702,12 @@ function getTelemetry(catalog: ToolSearchCatalogSession) {
   };
 }
 
+function sanitizeToolCallIdPart(value: string): string {
+  const trimmed = value.trim();
+  const safe = trimmed.replace(/[^A-Za-z0-9_.:-]+/g, "_").slice(0, 120);
+  return safe || "call";
+}
+
 class ToolSearchRuntime {
   private callSequence = 0;
 
@@ -732,12 +738,17 @@ class ToolSearchRuntime {
   call = async (
     id: string,
     input?: unknown,
-    options?: { signal?: AbortSignal; onUpdate?: AgentToolUpdateCallback<unknown> },
+    options?: {
+      parentToolCallId?: string;
+      signal?: AbortSignal;
+      onUpdate?: AgentToolUpdateCallback<unknown>;
+    },
   ) => {
     const catalog = resolveCatalog(this.ctx);
     const entry = findEntry(catalog, id);
     catalog.callCount += 1;
-    const toolCallId = `tool_search_code:${entry.name}:${++this.callSequence}`;
+    const parentId = sanitizeToolCallIdPart(options?.parentToolCallId ?? "direct");
+    const toolCallId = `tool_search_code:${parentId}:${entry.name}:${++this.callSequence}`;
     const executeTool =
       this.ctx.executeTool ??
       (async (params: Parameters<ToolSearchCatalogToolExecutor>[0]) =>
@@ -796,6 +807,7 @@ function toJsonSafe(value: unknown): unknown {
 }
 
 async function runCodeMode(params: {
+  toolCallId: string;
   ctx: ToolSearchToolContext;
   code: string;
   config: ToolSearchConfig;
@@ -808,6 +820,7 @@ async function runCodeMode(params: {
     code: params.code,
     config: params.config,
     logs,
+    parentToolCallId: params.toolCallId,
     runtime,
     signal: params.signal,
     onUpdate: params.onUpdate,
@@ -835,7 +848,11 @@ async function runCodeModeBridgeRequest(
   runtime: ToolSearchRuntime,
   method: CodeModeBridgeMethod,
   args: unknown,
-  options?: { signal?: AbortSignal; onUpdate?: AgentToolUpdateCallback<unknown> },
+  options?: {
+    parentToolCallId?: string;
+    signal?: AbortSignal;
+    onUpdate?: AgentToolUpdateCallback<unknown>;
+  },
 ): Promise<unknown> {
   const values = Array.isArray(args) ? args : [];
   switch (method) {
@@ -871,6 +888,7 @@ function runCodeModeChild(params: {
   code: string;
   config: ToolSearchConfig;
   logs: string[];
+  parentToolCallId: string;
   runtime: ToolSearchRuntime;
   signal?: AbortSignal;
   onUpdate?: AgentToolUpdateCallback<unknown>;
@@ -884,18 +902,34 @@ function runCodeModeChild(params: {
     const stderr: string[] = [];
     let settled = false;
     let timedOut = false;
-    let timer: ReturnType<typeof setTimeout>;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const bridgeAbortController = new AbortController();
+    let abortFromParent: () => void;
     const settle = (callback: () => void) => {
       if (settled) {
         return;
       }
       settled = true;
-      clearTimeout(timer);
+      if (timer) {
+        clearTimeout(timer);
+      }
+      params.signal?.removeEventListener("abort", abortFromParent);
       child.kill();
       callback();
     };
+    abortFromParent = () => {
+      bridgeAbortController.abort(params.signal?.reason);
+      child.kill("SIGKILL");
+      settle(() => reject(new Error("tool_search_code aborted")));
+    };
+    if (params.signal?.aborted) {
+      abortFromParent();
+      return;
+    }
+    params.signal?.addEventListener("abort", abortFromParent, { once: true });
     timer = setTimeout(() => {
       timedOut = true;
+      bridgeAbortController.abort(new Error("tool_search_code timed out"));
       child.kill("SIGKILL");
       settle(() => reject(new Error("tool_search_code timed out")));
     }, params.config.codeTimeoutMs);
@@ -955,7 +989,8 @@ function runCodeModeChild(params: {
         return;
       }
       void runCodeModeBridgeRequest(params.runtime, method, message.args, {
-        signal: params.signal,
+        parentToolCallId: params.parentToolCallId,
+        signal: bridgeAbortController.signal,
         onUpdate: params.onUpdate,
       })
         .then((value) => {
@@ -1017,12 +1052,14 @@ export function createToolSearchTools(ctx: ToolSearchToolContext): AnyAgentTool[
         }),
       }),
       execute: async (
-        _toolCallId: string,
+        toolCallId: string,
         args: unknown,
         signal?: AbortSignal,
         onUpdate?: AgentToolUpdateCallback<unknown>,
       ): Promise<AgentToolResult<unknown>> =>
-        jsonResult(await runCodeMode({ ctx, code: readCode(args), config, signal, onUpdate })),
+        jsonResult(
+          await runCodeMode({ toolCallId, ctx, code: readCode(args), config, signal, onUpdate }),
+        ),
     },
     {
       name: TOOL_SEARCH_RAW_TOOL_NAME,
@@ -1064,7 +1101,13 @@ export function createToolSearchTools(ctx: ToolSearchToolContext): AnyAgentTool[
         onUpdate?: AgentToolUpdateCallback<unknown>,
       ): Promise<AgentToolResult<unknown>> => {
         const call = readCallArgs(args);
-        return jsonResult(await runtime.call(call.id, call.input, { signal, onUpdate }));
+        return jsonResult(
+          await runtime.call(call.id, call.input, {
+            parentToolCallId: _toolCallId,
+            signal,
+            onUpdate,
+          }),
+        );
       },
     },
   ];

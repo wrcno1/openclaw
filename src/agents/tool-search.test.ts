@@ -86,11 +86,11 @@ describe("Tool Search", () => {
     });
 
     expect(alpha.execute).toHaveBeenCalledWith(
-      "tool_search_code:fake_create_ticket:1",
+      "tool_search_code:call-1:fake_create_ticket:1",
       {
         value: "ship",
       },
-      undefined,
+      expect.any(AbortSignal),
       undefined,
       undefined,
     );
@@ -192,9 +192,9 @@ describe("Tool Search", () => {
       code: `return await openclaw.tools.call("fake_hooked", { value: "ok" });`,
     });
     expect(target.execute).toHaveBeenCalledWith(
-      "tool_search_code:fake_hooked:1",
+      "tool_search_code:call-hooks:fake_hooked:1",
       { value: "ok" },
-      undefined,
+      expect.any(AbortSignal),
       undefined,
     );
   });
@@ -224,21 +224,35 @@ describe("Tool Search", () => {
 
     expect(target.execute).toHaveBeenNthCalledWith(
       1,
-      "tool_search_code:fake_repeated:1",
+      "tool_search_code:call-repeated:fake_repeated:1",
       {
         value: "one",
       },
-      undefined,
+      expect.any(AbortSignal),
       undefined,
       undefined,
     );
     expect(target.execute).toHaveBeenNthCalledWith(
       2,
-      "tool_search_code:fake_repeated:2",
+      "tool_search_code:call-repeated:fake_repeated:2",
       {
         value: "two",
       },
+      expect.any(AbortSignal),
       undefined,
+      undefined,
+    );
+    await runtimeCodeTool.execute("call-repeated-again", {
+      code: `return await openclaw.tools.call("fake_repeated", { value: "three" });`,
+    });
+
+    expect(target.execute).toHaveBeenNthCalledWith(
+      3,
+      "tool_search_code:call-repeated-again:fake_repeated:1",
+      {
+        value: "three",
+      },
+      expect.any(AbortSignal),
       undefined,
       undefined,
     );
@@ -279,9 +293,9 @@ describe("Tool Search", () => {
       expect.objectContaining({
         tool: expect.objectContaining({ name: "fake_lifecycle" }),
         toolName: "fake_lifecycle",
-        toolCallId: "tool_search_code:fake_lifecycle:1",
+        toolCallId: "tool_search_code:call-lifecycle:fake_lifecycle:1",
         input: { value: "ok" },
-        signal: abortController.signal,
+        signal: expect.any(AbortSignal),
         onUpdate,
       }),
     );
@@ -302,7 +316,7 @@ describe("Tool Search", () => {
       expect.objectContaining({
         tool: expect.objectContaining({ name: "fake_lifecycle" }),
         toolName: "fake_lifecycle",
-        toolCallId: "tool_search_code:fake_lifecycle:1",
+        toolCallId: "tool_search_code:call-lifecycle-structured:fake_lifecycle:1",
         input: { value: "structured" },
         signal: abortController.signal,
         onUpdate,
@@ -432,4 +446,63 @@ describe("Tool Search", () => {
       }),
     ).rejects.toThrow("tool_search_code timed out");
   }, 5_000);
+
+  it("aborts already-started bridged calls when code mode times out", async () => {
+    const codeTool = fakeTool(TOOL_SEARCH_CODE_MODE_TOOL_NAME, "code mode");
+    const target = pluginTool("fake_abort_on_timeout", "Long-running target tool");
+    let observedSignal: AbortSignal | undefined;
+    let abortCount = 0;
+    target.execute = vi.fn(
+      async (
+        _toolCallId: string,
+        _input: unknown,
+        signal?: AbortSignal,
+      ): Promise<ReturnType<typeof jsonResult>> => {
+        observedSignal = signal;
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) {
+            abortCount += 1;
+            resolve();
+            return;
+          }
+          signal?.addEventListener(
+            "abort",
+            () => {
+              abortCount += 1;
+              resolve();
+            },
+            { once: true },
+          );
+        });
+        return jsonResult({ aborted: true });
+      },
+    );
+
+    const config = {
+      tools: {
+        toolSearch: { enabled: true, mode: "code", codeTimeoutMs: 100 },
+      },
+    } as never;
+    applyToolSearchCatalog({
+      tools: [codeTool, target],
+      config,
+      sessionId: "session-abort-timeout",
+      sessionKey: "agent:main:main",
+    });
+
+    const [runtimeCodeTool] = createToolSearchTools({
+      sessionId: "session-abort-timeout",
+      sessionKey: "agent:main:main",
+      config,
+    });
+
+    await expect(
+      runtimeCodeTool.execute("call-abort-timeout", {
+        code: `return await openclaw.tools.call("fake_abort_on_timeout", { value: "wait" });`,
+      }),
+    ).rejects.toThrow("tool_search_code timed out");
+    expect(observedSignal).toBeDefined();
+    expect(observedSignal?.aborted).toBe(true);
+    expect(abortCount).toBe(1);
+  });
 });
