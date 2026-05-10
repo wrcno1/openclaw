@@ -97,8 +97,7 @@ type CodeModeBridgeResultMessage = {
 const TOOL_SEARCH_CODE_MODE_CHILD_SOURCE = String.raw`
 import vm from "node:vm";
 
-const pending = new Map();
-let nextBridgeId = 1;
+let activeController;
 
 function send(message) {
   if (typeof process.send === "function") {
@@ -142,71 +141,131 @@ function formatLogItem(value) {
   return typeof safe === "string" ? safe : JSON.stringify(safe);
 }
 
-function bridge(method, args) {
-  let promise;
-  const start = () => {
-    if (!promise) {
-      const id = String(nextBridgeId++);
-      promise = new Promise((resolve, reject) => {
-        pending.set(id, { resolve, reject });
-        send({ type: "bridge", id, method, args });
-      });
-    }
-    return promise;
-  };
-  return Object.freeze({
-    then: (resolve, reject) => start().then(resolve, reject),
-    catch: (reject) => start().catch(reject),
-    finally: (onFinally) => start().finally(onFinally),
-  });
+function bridgeResultPayload(message) {
+  if (!message.ok) {
+    return typeof message.error === "string" ? message.error : "tool bridge failed";
+  }
+  const json = JSON.stringify(toJsonSafe(message.value));
+  return typeof json === "string" ? json : "null";
 }
 
 function settleBridge(message) {
-  const id = typeof message?.id === "string" ? message.id : "";
-  const waiter = pending.get(id);
-  if (!waiter) {
+  if (!activeController) {
     return;
   }
-  pending.delete(id);
-  if (message.ok) {
-    waiter.resolve(message.value);
-  } else {
-    waiter.reject(new Error(typeof message.error === "string" ? message.error : "tool bridge failed"));
+  const id = typeof message?.id === "string" ? message.id : "";
+  try {
+    activeController.settleBridge(id, Boolean(message.ok), bridgeResultPayload(message));
+  } catch (error) {
+    send({
+      type: "result",
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+function buildModelScriptSource(code) {
+  return "(async (openclaw, console) => {\n" + code + "\n})(openclaw, console)";
+}
+
+function buildControllerSource(code) {
+  return (
+    '"use strict";\n' +
+    "(() => {\n" +
+    "const pending = new Map();\n" +
+    "const bridgeMessages = [];\n" +
+    "const logs = [];\n" +
+    "let nextBridgeId = 1;\n" +
+    toJsonSafe.toString() +
+    "\n" +
+    formatLogItem.toString() +
+    "\n" +
+    "function bridge(method, args) {\n" +
+    "  let promise;\n" +
+    "  const start = () => {\n" +
+    "    if (!promise) {\n" +
+    "      const id = String(nextBridgeId++);\n" +
+    "      promise = new Promise((resolve, reject) => {\n" +
+    "        pending.set(id, { resolve, reject });\n" +
+    "        bridgeMessages.push({ id, method, args: toJsonSafe(args) });\n" +
+    "      });\n" +
+    "    }\n" +
+    "    return promise;\n" +
+    "  };\n" +
+    "  return Object.freeze({\n" +
+    "    then: (resolve, reject) => start().then(resolve, reject),\n" +
+    "    catch: (reject) => start().catch(reject),\n" +
+    "    finally: (onFinally) => start().finally(onFinally),\n" +
+    "  });\n" +
+    "}\n" +
+    "const console = Object.freeze({\n" +
+    "  log: (...items) => logs.push(items.map(formatLogItem)),\n" +
+    "  warn: (...items) => logs.push(items.map(formatLogItem)),\n" +
+    "  error: (...items) => logs.push(items.map(formatLogItem)),\n" +
+    "});\n" +
+    "const openclaw = Object.freeze({\n" +
+    "  tools: Object.freeze({\n" +
+    "    search: (query, options) => bridge('search', [query, options]),\n" +
+    "    describe: (id) => bridge('describe', [id]),\n" +
+    "    call: (id, input) => bridge('call', [id, input]),\n" +
+    "  }),\n" +
+    "});\n" +
+    "const result = Promise.resolve(" +
+    buildModelScriptSource(code) +
+    ").then(\n" +
+    "  (value) => ({ ok: true, value: toJsonSafe(value) }),\n" +
+    "  (error) => ({ ok: false, error: error instanceof Error ? error.message : String(error) }),\n" +
+    ");\n" +
+    "return Object.freeze({\n" +
+    "  result,\n" +
+    "  takeLogs: () => logs.splice(0),\n" +
+    "  takeBridgeMessages: () => bridgeMessages.splice(0),\n" +
+    "  settleBridge: (id, ok, payload) => {\n" +
+    "    const waiter = pending.get(String(id));\n" +
+    "    if (!waiter) return;\n" +
+    "    pending.delete(String(id));\n" +
+    "    if (ok) {\n" +
+    "      waiter.resolve(JSON.parse(String(payload)));\n" +
+    "    } else {\n" +
+    "      waiter.reject(new Error(String(payload)));\n" +
+    "    }\n" +
+    "  },\n" +
+    "});\n" +
+    "})()"
+  );
+}
+
+function pumpController(controller) {
+  for (const items of controller.takeLogs()) {
+    send({ type: "log", items });
+  }
+  for (const message of controller.takeBridgeMessages()) {
+    send({ type: "bridge", id: message.id, method: message.method, args: message.args });
   }
 }
 
 async function runModelCode(code, timeoutMs) {
   const sandbox = Object.create(null);
-  const consoleBridge = Object.freeze({
-    log: (...items) => send({ type: "log", items: items.map(formatLogItem) }),
-    warn: (...items) => send({ type: "log", items: items.map(formatLogItem) }),
-    error: (...items) => send({ type: "log", items: items.map(formatLogItem) }),
-  });
-  const openclaw = Object.freeze({
-    tools: Object.freeze({
-      search: (query, options) => bridge("search", [query, options]),
-      describe: (id) => bridge("describe", [id]),
-      call: (id, input) => bridge("call", [id, input]),
-    }),
-  });
-  Object.defineProperties(sandbox, {
-    console: { value: consoleBridge, enumerable: true },
-    openclaw: { value: openclaw, enumerable: true },
-  });
   const context = vm.createContext(sandbox, {
     name: "tool_search_code",
     codeGeneration: { strings: false, wasm: false },
   });
-  const wrappedCode =
-    '"use strict";\n(async (openclaw, console) => {\n' +
-    code +
-    "\n})(openclaw, console)";
-  const script = new vm.Script(wrappedCode, { filename: "tool_search_code:model.js" });
-  const value = await script.runInContext(context, {
+  const script = new vm.Script(buildControllerSource(code), { filename: "tool_search_code:model.js" });
+  const controller = script.runInContext(context, {
     timeout: Math.max(1, Math.min(Number(timeoutMs) || 1, 2147483647)),
     breakOnSigint: false,
   });
-  send({ type: "result", ok: true, value: toJsonSafe(value) });
+  activeController = controller;
+  const pumpTimer = setInterval(() => pumpController(controller), 1);
+  try {
+    const result = await controller.result;
+    pumpController(controller);
+    send(result.ok ? { type: "result", ok: true, value: result.value } : result);
+  } finally {
+    clearInterval(pumpTimer);
+    activeController = undefined;
+  }
 }
 
 process.on("message", (message) => {

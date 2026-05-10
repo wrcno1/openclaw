@@ -360,6 +360,44 @@ describe("Tool Search", () => {
         code: `return globalThis.constructor.constructor("return process")();`,
       }),
     ).rejects.toThrow();
+    await expect(
+      runtimeCodeTool.execute("call-console-escape", {
+        code: `return console.log.constructor.constructor("return process")();`,
+      }),
+    ).rejects.toThrow();
+    await expect(
+      runtimeCodeTool.execute("call-bridge-escape", {
+        code: `return openclaw.tools.call.constructor.constructor("return process")();`,
+      }),
+    ).rejects.toThrow();
+  });
+
+  it("does not expose host-realm bridge result objects to model-authored code", async () => {
+    const codeTool = fakeTool(TOOL_SEARCH_CODE_MODE_TOOL_NAME, "code mode");
+    const target = pluginTool("fake_bridge_result_escape", "Target for bridge result escape");
+
+    applyToolSearchCatalog({
+      tools: [codeTool, target],
+      config: { tools: { toolSearch: true } } as never,
+      sessionId: "session-bridge-result-escape",
+      sessionKey: "agent:main:main",
+    });
+
+    const [runtimeCodeTool] = createToolSearchTools({
+      sessionId: "session-bridge-result-escape",
+      sessionKey: "agent:main:main",
+      config: {},
+    });
+
+    await expect(
+      runtimeCodeTool.execute("call-bridge-result-escape", {
+        code: `
+          const hits = await openclaw.tools.search("bridge result", { limit: 1 });
+          return hits.constructor.constructor("return process")();
+        `,
+      }),
+    ).rejects.toThrow();
+    expect(target.execute).not.toHaveBeenCalled();
   });
 
   it("terminates async continuations that block the event loop after a bridge call", async () => {
